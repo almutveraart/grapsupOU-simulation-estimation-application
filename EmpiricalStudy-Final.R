@@ -1,8 +1,60 @@
+# ============================================================
+# EmpiricalStudy-Final.R
+#
+# Empirical application of the graph supOU model to wind
+# capacity factors (WCFs) at 24 nodes in Portugal, using
+# data from the RE-Europe dataset (Jensen & Pinson, 2017).
+#
+# This script reproduces the empirical study in Section 5 of:
+#
+#   Mehta, S. and Veraart, A. E. D. (2026).
+#   "Statistical inference for Lévy-driven graph supOU processes:
+#    From short- to long-memory in high-dimensional time series."
+#   arXiv:2502.08838 [stat.ME] (preprint).
+#   https://arxiv.org/abs/2502.08838
+#
+# Required input files (must be in the working directory):
+#   wind_signal_COSMO.csv  -- hourly WCF time series, N=26304 obs,
+#                             d=24 nodes; column 1 = timestamps,
+#                             columns 2-25 = node WCFs
+#   adj_mat.csv            -- 24x24 adjacency matrix for the
+#                             Portuguese subnetwork (Figure 4a)
+#
+# Required R files (must be sourced before running):
+#   GraphSupOU-Functions-Final.R  -- defines col_normalise_adjacency_matrix,
+#                                    find_max_eigen, objective_function,
+#                                    objective_function_OU, objective_function_2OU,
+#                                    f, f_exp, f_2exp, create_K
+#
+# Output files (EPS):
+#   heatmap-original.eps   -- heatmap of raw WCF time series (Figure 5a)
+#   empacfs-original.eps   -- ACF boxplots of raw data         (Figure 5b)
+#   Lisbondata-original.eps-- Lisbon node time series (raw)    (Figure 5c)
+#   heatmap.eps            -- heatmap of deseasonalised data   (Figure 5d)
+#   empacfs.eps            -- ACF boxplots after deseasonalising(Figure 5e)
+#   Lisbondata.eps         -- Lisbon node time series (des.)   (Figure 5f)
+#   alphac-vec.eps         -- alpha-hat and c-hat vs N*        (Figure 6a)
+#   Fit.eps                -- fitted eigenvalue curves, N*=40  (Figure 6b)
+#   Fit100.eps             -- fitted eigenvalue curves, N*=100 (Figure 6c)
+#   estmean.eps            -- estimated Levy basis mean        (Figure 7a)
+#   estvar.eps             -- estimated Levy basis variance     (Figure 7b)
+#   empvar.eps             -- empirical covariance Var(X)      (Figure 7c)
+#   normA.eps              -- column-normalised adjacency matrix(Figure 4b)
+#   stationary_data.csv    -- deseasonalised and detrended WCFs
+#
+# Dependencies: forecast, ggplot2, reshape2, tidyr, ggrastr
+# Minimum requirements: R >= 4.1.0
+# Note: GraphSupOU-Functions-Final.R must be sourced first.
+# ============================================================
 library(forecast)
 library(ggplot2)
 library(reshape2)
 library(tidyr)
+library(ggrastr)
 
+# ── Load raw data ─────────────────────────────────────────────────────────────
+# wind_signal_COSMO.csv: N=26304 hourly observations (2012-2014),
+# d=24 nodes in Portugal. Column 1 = timestamp, columns 2-25 = WCFs.
 # Read in the data
 data <- read.csv("wind_signal_COSMO.csv")
 
@@ -19,6 +71,9 @@ plot(POR_data$X1, type="l")
 acf(ts(POR_data$X1))
 
 
+# ── Exploratory plots: raw data ───────────────────────────────────────────────
+# Figures 5a, 5b, 5c in the paper.
+
 # Prepare the data for plotting
 Time_ad <- as.POSIXct(Time, format = "%Y-%m-%d %H:%M:%S")
 
@@ -30,8 +85,10 @@ POR_data_long$variable <- as.numeric(gsub("X", "", POR_data_long$variable))
 
 breaks <- seq(1, max(POR_data_long$variable), by = 4)
 
+# Figure 5a: heatmap of raw 24-dimensional WCF time series
 ggplot(POR_data_long, aes(x = variable, y = Time, fill = value)) +
-  geom_tile() +
+  #geom_tile() +
+  rasterise(geom_tile(), dpi = 150) +   # rasterize only the tiles
   scale_x_continuous(breaks = breaks) +  
   scale_fill_gradientn(
     colors = c("blue", "white", "red"),    
@@ -50,11 +107,12 @@ ggplot(POR_data_long, aes(x = variable, y = Time, fill = value)) +
     legend.text = element_text(size = 25),
     legend.title = element_text(size = 25)
   )
-ggsave("heatmap-original.eps", width = 20, height = 20, units = "cm")
+ggsave("heatmap-original.eps", width = 20, height = 20, units = "cm", dpi=150)
 
 
-##########################################
-# Plot acfs of original data
+# ── Figure 5b: ACF boxplots of raw data ──────────────────────────────────────
+# Boxplots of ACFs across all 24 nodes at lags 0, ..., 48.
+# The dotted blue lines show the 95% confidence band +/- 1.96/sqrt(N).
 lag_length <- 48
 
 acf_list <- lapply(1:24, function(i) stats::acf(POR_data[, i], lag.max = lag_length, plot = FALSE))
@@ -85,8 +143,7 @@ ggplot(acf_data, aes(x = factor(Lag), y = ACF_Value)) +
 
 ggsave("empacfs-original.eps", width = 20, height = 20, units = "cm")
 
-###################
-# Plot the Lisbon data
+# ── Figure 5c: Lisbon (node 22) raw time series ───────────────────────────────
 Lisbon_data <- POR_data[, 22] 
 
 time_series_data <- data.frame(Time_ad, Lisbon_data)
@@ -104,8 +161,14 @@ ggplot(time_series_data, aes(x = Time_ad, y = Lisbon_data)) +
 ggsave("Lisbondata-original.eps", width = 20, height = 20, units = "cm")
 
 
+# ── Deseasonalisation and detrending ─────────────────────────────────────────
+# Raw WCFs exhibit daily (period = 24h) and yearly (period = 24*365h) seasonality
+# and a mild trend. We remove both using two-pass STL decomposition:
+#   Pass 1: remove daily seasonality and retain (remainder + trend)
+#   Pass 2: remove yearly seasonality from the Pass 1 output
+# The final "remainder" component is stored as the stationary series.
+# See Section 5 of the paper for discussion.
 
-#####################################################
 # Create a matrix to store the stationary components
 stationary_matrix <- matrix(NA, nrow = nrow(POR_data), ncol = ncol(POR_data))
 
@@ -140,12 +203,15 @@ head(stationary_data)
 plot(stationary_data[,1], type = "l")
 acf(stationary_data[,1], lag=200)
 
-# Save the deseasonalised data
+# Save the deseasonalised data for downstream use
 output_file <- "stationary_data.csv"
 write.csv(stationary_data, file = output_file, row.names = FALSE)
 
 
-# Plot the acf boxplots and the time series in Lisbon
+# ── Exploratory plots: deseasonalised data ────────────────────────────────────
+# Figures 5d, 5e, 5f in the paper.
+
+# Figure 5e: ACF boxplots of deseasonalised data
 lag_length <- 48
 
 acf_list <- lapply(1:24, function(i) stats::acf(stationary_data[, i], lag.max = lag_length, plot = FALSE))
@@ -173,8 +239,7 @@ ggplot(acf_data, aes(x = factor(Lag), y = ACF_Value)) +
 
 ggsave("empacfs.eps", width = 20, height = 20, units = "cm")
 
-# Plot Lisbon time series
-
+# Figure 5f: Lisbon (node 22) deseasonalised time series
 Time <- data[, 1]
 Time <- as.POSIXct(Time, format = "%Y-%m-%d %H:%M:%S")
 
@@ -194,7 +259,7 @@ ggplot(time_series_data, aes(x = Time, y = Lisbon_data)) +
   )
 ggsave("Lisbondata.eps", width = 20, height = 20, units = "cm")
 
-##################Heatmap of stationary data
+# Figure 5d: heatmap of deseasonalised data
 POR_data_combined <- cbind(Time = Time_ad, stationary_data)
 
 POR_data_long <- melt(POR_data_combined, id.vars = "Time")
@@ -205,7 +270,8 @@ breaks <- seq(1, max(POR_data_long$variable), by = 4)
 
 
 ggplot(POR_data_long, aes(x = variable, y = Time, fill = value)) +
-  geom_tile() +
+  #geom_tile() +
+  rasterise(geom_tile(), dpi = 150) +   # rasterize only the tiles
   scale_x_continuous(breaks = breaks) +  
   scale_fill_gradientn(
     colors = c("blue", "white", "red"),    
@@ -224,22 +290,32 @@ ggplot(POR_data_long, aes(x = variable, y = Time, fill = value)) +
     legend.text = element_text(size = 25),
     legend.title = element_text(size = 25)
   )
-ggsave("heatmap.eps", width = 20, height = 20, units = "cm")
+ggsave("heatmap.eps", width = 20, height = 20, units = "cm", dpi=150)
 
 
-######################
-# Fit the Grap supOU model
+# ── Fit the graph supOU model ─────────────────────────────────────────────────
+# Estimation follows the two-step procedure of Section 3.1:
+#   Step 1: minimise L(alpha, c) over the empirical max real eigenvalues
+#           of R_hat(h) = cov_hat(h) %*% cov_hat(0)^{-1} (equation (14))
+#   Step 2: recover mu_L and sigma^2_L from sample mean and covariance
+
 # Read in data
 my_data <- read.csv(file = "stationary_data.csv")
 
 #Read in adjacency matrix
 Port_adjacency <- apply(as.matrix(read.csv(file = "adj_mat.csv")),2, as.numeric)
 
-#Column normalisation of adjacency matrix
+# Column normalisation of adjacency matrix (see Section 2.3 and Figure 4b)
 A_norm <- col_normalise_adjacency_matrix(Port_adjacency)
 A_norm
 
 X<-as.matrix(my_data)
+
+# ── Figure 6a: alpha-hat and c-hat as a function of N* ───────────────────────
+# Sweep N* from 5 to 100 lags. For each N*, re-estimate (alpha, c) by
+# minimising the Gamma supOU loss function (14) via L-BFGS-B with
+# box constraints: c in (-1, 1), alpha > 1.
+# The estimates stabilise around N* = 40; see Section 5.
 
 # Compute the parameters for different lags
 lag_vector <- seq(5, 100, by=1)
@@ -247,6 +323,7 @@ l <- length(lag_vector)
 alpha_vector <- numeric(l)
 c_vector <- numeric(l)
 
+# Precompute eigenvalues for all lags up to 100 once (reused in the loop)
 ev_all <- find_max_eigen(X, 100)
 max_real_eigenvalues_all <- ev_all$max_real_eigenvalues
 
@@ -281,7 +358,7 @@ data_long <- pivot_longer(data, cols = c("alpha", "c"), names_to = "Variable", v
 ggplot(data_long, aes(x = Lag, y = Value, color = Variable)) +
   geom_line(size = 1) +  
   labs(
-    x = "Lag",
+    x = bquote(N^"*"),
     y = "Values",
     color = "" 
   ) +
@@ -298,6 +375,12 @@ ggplot(data_long, aes(x = Lag, y = Value, color = Variable)) +
   )
 ggsave("alphac-vec.eps", width = 20, height = 20, units = "cm")
 
+
+# ── Figure 6b: fitted eigenvalue curves at N* = 40 ───────────────────────────
+# Three models are compared against the empirical max real eigenvalue sequence:
+#   - Graph supOU with Gamma(alpha, 1) kernel  [equation (12)]
+#   - Graph OU (single exponential decay)
+#   - Graph supOU with sum of two exponentials [equation (11)]
 
 # Fit model for 40 lags
 max_lag <- 40
@@ -327,7 +410,7 @@ alpha <- fit$par[2]
 y_values <- f(h_values, c, alpha, Delta)
 
 
-# Plot the function
+# Quick diagnostic plot (base R) comparing fitted vs empirical eigenvalue curve
 plot(
   h_values, y_values,
   type = "o",
@@ -349,10 +432,7 @@ points(
 )
 
 # Plot diagnostic plots for all eigenvalues
-
-
 A_norm_eigen <- eigen(A_norm)$value
-
 
 
 ### OU case
@@ -445,6 +525,10 @@ p <- ggplot(plot_data, aes(x = h, y = value, color = category, shape = category)
 print(p)
 
 ggsave("Fit.eps", plot = p, width = 20, height = 20, units = "cm")
+
+# ── Figure 6c: fitted eigenvalue curves at N* = 100 ──────────────────────────
+# Repeat the three-model comparison using N* = 100 lags to confirm
+# robustness of the estimates to the choice of N*; see Section 5.
 
 #####Repeat for lag =100
 max_lag <- 100
@@ -566,11 +650,12 @@ print(p)
 ggsave("Fit100.eps", plot = p, width = 20, height = 20, units = "cm")
 
 
-
-
-
-###################################
-# Recover the mean and variance matrix
+# ── Step 2: recover Lévy basis mean and variance ──────────────────────────────
+# Using the N*=40 estimates of (alpha, c), recover the Lévy basis parameters:
+#   mu_L  = (1 - alpha) * K(c) %*% X_bar
+#   sigma^2_L = (1 - alpha) * (K(c) %*% Cov(X) + Cov(X) %*% K(c)^T)
+# See equation (9) and Proposition 3.2 in the paper.
+# Figures 7a, 7b, 7c in the paper.
 
 max_lag <- 40
 ev <- find_max_eigen(X, max_lag)
@@ -596,13 +681,15 @@ fit$par
 c <- fit$par[1] 
 alpha <- fit$par[2]
 
+# Construct drift matrix K(c) = -I - c * A_bar^T (equation (5))
 K <- create_K(c, A_norm)
 
+# Estimate Levy basis mean and variance (equation (9), Proposition 3.2)
 mean <- (1-alpha)*K%*%as.numeric(colMeans(X))
 var <- (1-alpha)*(K%*%cov(X)+cov(X)%*%t(K))
 
 
-# Plot the heatmap for the mean vector
+# ── Figure 7a: estimated Lévy basis mean ─────────────────────────────────────
 mean_data <- data.frame(Dimension = 1:24, Mean = mean)
 
 p <- ggplot(mean_data, aes(x = Dimension, y = Mean, fill = Mean)) +
@@ -624,7 +711,7 @@ p
 
 ggsave("estmean.eps", plot = p, width = 20, height = 20, units = "cm")
 
-# Plot the heatmap for the variance-covariance matrix
+# ── Figure 7b: estimated Lévy basis variance matrix ──────────────────────────
 var_data <- melt(var)
 colnames(var_data) <- c("Row", "Column", "Value")
 var_data$Row <- factor(var_data$Row)
@@ -650,12 +737,11 @@ p<-ggplot(var_data, aes(x = Row, y = Column, fill = Value)) +
   scale_x_discrete(breaks = seq(4, 24, by = 4), labels = as.character(seq(4, 24, by = 4))) +
   scale_y_discrete(breaks = paste0("X", seq(4, 24, by = 4)), labels = seq(4, 24, by = 4))
 
-  
+
 p
 ggsave("estvar.eps",  plot=p, width = 20, height = 20, units = "cm")
 
-# Add data covariance as comparison:
-
+# ── Figure 7c: empirical covariance Var(X) for comparison ────────────────────
 var_data <- melt(cov(X))
 colnames(var_data) <- c("Row", "Column", "Value")
 
@@ -687,7 +773,7 @@ p
 ggsave("empvar.eps",  plot=p, width = 20, height = 20, units = "cm")
 
 
-# Plot normalised A
+# ── Figure 4b: column-normalised adjacency matrix ─────────────────────────────
 
 var_data <- melt(A_norm)
 colnames(var_data) <- c("Row", "Column", "Value")
@@ -717,4 +803,3 @@ p<-ggplot(var_data, aes(x = Row, y = Column, fill = Value)) +
 
 p
 ggsave("normA.eps",  plot=p, width = 20, height = 20, units = "cm")
-
